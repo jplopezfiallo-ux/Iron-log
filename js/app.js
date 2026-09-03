@@ -2,9 +2,13 @@
 'use strict';
 
 const {
-  DB: Store, uid, seedIfEmpty, exportAllData, importAllData,
+  DB: Store, uid, seedIfEmpty, exportAllData, importAllData, validateBackupPayload,
+  EXERCISE_CATEGORIES, TRACKING_TYPES,
   toDisplayWeight, toStoredLbs,
 } = window.IronLogDB;
+const {
+  localISODate, isoDaysAgo, isBodyweightExercise, setVolume, aggregateByDate,
+} = window.IronLogDomain;
 
 const ICONS = [
   'bench-press', 'lat-pulldown', 'machine-row', 'machine-shoulder-press',
@@ -57,13 +61,7 @@ function fmtDate(d) {
 }
 
 function todayISO() {
-  return new Date().toISOString().slice(0, 10);
-}
-
-function isoDaysAgo(n) {
-  const d = new Date();
-  d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
+  return localISODate();
 }
 
 function exerciseById(id) {
@@ -71,6 +69,17 @@ function exerciseById(id) {
 }
 function profileById(id) {
   return state.profiles.find((p) => p.id === id);
+}
+
+function categoryRank(id) {
+  const index = EXERCISE_CATEGORIES.findIndex((category) => category.id === id);
+  return index === -1 ? EXERCISE_CATEGORIES.length : index;
+}
+
+function activeExercises() {
+  return state.exercises
+    .filter((exercise) => !exercise.archived)
+    .sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.name.localeCompare(b.name));
 }
 
 function isCompleted(session) {
@@ -107,12 +116,14 @@ async function loadAll() {
     Store.getAll('sets'),
   ]);
   state.profiles = profiles.sort((a, b) => a.createdAt - b.createdAt);
-  state.exercises = exercises.sort((a, b) => a.name.localeCompare(b.name));
+  state.exercises = exercises.sort((a, b) => categoryRank(a.category) - categoryRank(b.category) || a.name.localeCompare(b.name));
   state.routines = routines;
   state.sessions = sessions.sort((a, b) => b.date.localeCompare(a.date));
   state.sets = sets;
 
-  if (!state.activeProfileId && state.profiles.length) {
+  if (state.profiles.length === 0) {
+    state.activeProfileId = null;
+  } else if (!profileById(state.activeProfileId)) {
     const preferred = state.profiles.find((p) => p.id === state._lastActiveProfileId);
     state.activeProfileId = preferred ? preferred.id : state.profiles[0].id;
   }
@@ -121,7 +132,7 @@ async function loadAll() {
 function reconstructActiveSession(profileId) {
   const inProgress = state.sessions.find((s) => s.profileId === profileId && s.status === 'in_progress');
   if (!inProgress) return null;
-  const exerciseIds = inProgress.exerciseIds || [];
+  const exerciseIds = [...new Set(inProgress.exerciseIds || [])];
   const exercises = exerciseIds.map((eid) => {
     const sets = state.sets
       .filter((s) => s.sessionId === inProgress.id && s.exerciseId === eid)
@@ -143,6 +154,7 @@ async function switchProfile(id) {
   state._lastActiveProfileId = id;
   await setMeta('lastActiveProfileId', id);
   state.activeSession = reconstructActiveSession(id);
+  state.progressProfileIds = [id];
   render();
 }
 
@@ -169,6 +181,11 @@ function render(forceScreen) {
   if (forceScreen) {
     app.innerHTML = '';
     app.appendChild(forceScreen);
+    return;
+  }
+  if (state.profiles.length === 0) {
+    app.innerHTML = '';
+    app.appendChild(profileOnboardingScreen());
     return;
   }
   app.innerHTML = '';
@@ -340,7 +357,13 @@ function profilesScreen() {
         const sessions = await Store.getAllByIndex('sessions', 'profileId', p.id);
         for (const s of sessions) await Store.delete('sessions', s.id);
         await Store.delete('profiles', p.id);
-        if (state.activeProfileId === p.id) state.activeProfileId = null;
+        if (state.activeProfileId === p.id) {
+          state.activeProfileId = null;
+          state.activeSession = null;
+          state.progressProfileIds = [];
+          state._lastActiveProfileId = null;
+          await setMeta('lastActiveProfileId', null);
+        }
         await loadAll();
         state.activeSession = reconstructActiveSession(state.activeProfileId);
         overlay.remove();
@@ -407,16 +430,14 @@ function profilesScreen() {
   fileInput.onchange = async () => {
     const file = fileInput.files[0];
     if (!file) return;
-    const text = await file.text();
     try {
-      const payload = JSON.parse(text);
-      await importAllData(payload, { replace: false });
-      await loadAll();
-      state.activeSession = reconstructActiveSession(state.activeProfileId);
-      render();
-      alert('Backup imported.');
+      const payload = JSON.parse(await file.text());
+      validateBackupPayload(payload);
+      openImportPreview(payload);
     } catch (err) {
       alert('Could not import that file: ' + err.message);
+    } finally {
+      fileInput.value = '';
     }
   };
   importBtn.onclick = () => fileInput.click();
@@ -427,21 +448,105 @@ function profilesScreen() {
   return wrap;
 }
 
+function openImportPreview(payload) {
+  const normalized = validateBackupPayload(payload);
+  const counts = normalized.data;
+  const content = el('div');
+  content.appendChild(el('h3', 'modal-title', 'Import backup'));
+  content.appendChild(el(
+    'p',
+    'field-hint',
+    `${counts.profiles.length} profiles, ${counts.exercises.length} exercises, ${counts.routines.length} routines, ${counts.sessions.length} workouts, and ${counts.sets.length} sets are ready to import.`
+  ));
+  content.appendChild(el('p', 'field-hint', 'Merge keeps current records. Replace removes current workout data after the backup has been fully validated.'));
+
+  const actions = el('div', 'btn-row import-actions');
+  const mergeBtn = el('button', 'btn secondary', 'Merge');
+  const replaceBtn = el('button', 'btn danger', 'Replace all data');
+  const cancelBtn = el('button', 'btn secondary', 'Cancel');
+
+  const runImport = async (replace) => {
+    if (replace && !confirm('Replace all current Iron Log data with this backup?')) return;
+    [mergeBtn, replaceBtn, cancelBtn].forEach((button) => { button.disabled = true; });
+    try {
+      await importAllData(payload, { replace });
+      await loadAll();
+      state.activeSession = reconstructActiveSession(state.activeProfileId);
+      state.progressProfileIds = state.activeProfileId ? [state.activeProfileId] : [];
+      overlay.remove();
+      render();
+      alert('Backup imported successfully.');
+    } catch (error) {
+      [mergeBtn, replaceBtn, cancelBtn].forEach((button) => { button.disabled = false; });
+      alert('Import was rolled back: ' + error.message);
+    }
+  };
+
+  mergeBtn.onclick = () => runImport(false);
+  replaceBtn.onclick = () => runImport(true);
+  cancelBtn.onclick = () => overlay.remove();
+  actions.appendChild(mergeBtn);
+  actions.appendChild(replaceBtn);
+  actions.appendChild(cancelBtn);
+  content.appendChild(actions);
+  const overlay = modal(content);
+}
+
 // ================= EXERCISES =================
 function exercisesScreen() {
   const wrap = el('div', 'section');
   wrap.appendChild(el('h2', 'section-title', 'Exercise library'));
 
+  const controls = el('div', 'exercise-filters');
+  const searchInput = document.createElement('input');
+  searchInput.type = 'search';
+  searchInput.className = 'text-input';
+  searchInput.placeholder = 'Search exercises';
+  searchInput.setAttribute('aria-label', 'Search exercises');
+  controls.appendChild(searchInput);
+
+  const categoryFilter = document.createElement('select');
+  categoryFilter.className = 'select-input';
+  categoryFilter.setAttribute('aria-label', 'Filter exercises by category');
+  categoryFilter.appendChild(new Option('All categories', 'all'));
+  EXERCISE_CATEGORIES.forEach((category) => categoryFilter.appendChild(new Option(category.label, category.id)));
+  controls.appendChild(categoryFilter);
+  wrap.appendChild(controls);
+
   const list = el('div', 'list');
-  state.exercises.forEach((ex) => {
-    const row = el('div', 'list-row');
-    row.appendChild(iconImg(ex.icon));
-    row.appendChild(el('span', 'row-label', ex.name));
-    const editBtn = el('button', 'icon-btn', '✎');
-    editBtn.onclick = () => openExerciseModal(ex);
-    row.appendChild(editBtn);
-    list.appendChild(row);
-  });
+  const refreshList = () => {
+    list.innerHTML = '';
+    const query = searchInput.value.trim().toLocaleLowerCase();
+    const selectedCategory = categoryFilter.value;
+    const matches = activeExercises().filter((exercise) =>
+      (selectedCategory === 'all' || exercise.category === selectedCategory)
+      && (!query || exercise.name.toLocaleLowerCase().includes(query))
+    );
+
+    EXERCISE_CATEGORIES.forEach((category) => {
+      const categoryExercises = matches.filter((exercise) => exercise.category === category.id);
+      if (categoryExercises.length === 0) return;
+      list.appendChild(el('h3', 'category-heading', category.label));
+      categoryExercises.forEach((exercise) => {
+        const row = el('div', 'list-row');
+        row.appendChild(iconImg(exercise.icon));
+        const details = el('span', 'row-details');
+        details.appendChild(el('span', 'row-label', exercise.name));
+        details.appendChild(el('span', 'row-meta', isBodyweightExercise(exercise) ? 'Bodyweight' : 'Weighted'));
+        row.appendChild(details);
+        const editBtn = el('button', 'icon-btn', '✎');
+        editBtn.setAttribute('aria-label', `Edit ${exercise.name}`);
+        editBtn.onclick = () => openExerciseModal(exercise);
+        row.appendChild(editBtn);
+        list.appendChild(row);
+      });
+    });
+
+    if (matches.length === 0) list.appendChild(el('p', 'empty-state', 'No exercises match your search.'));
+  };
+  searchInput.oninput = refreshList;
+  categoryFilter.onchange = refreshList;
+  refreshList();
   wrap.appendChild(list);
 
   const addBtn = el('button', 'btn secondary', '+ Add exercise');
@@ -460,6 +565,34 @@ function openExerciseModal(existing) {
   nameInput.value = existing ? existing.name : '';
   content.appendChild(nameInput);
 
+  content.appendChild(el('div', 'field-label', 'Tracking'));
+  let selectedTrackingType = existing ? existing.trackingType : 'weighted';
+  const typeRow = el('div', 'btn-row tracking-toggle');
+  const typeButtons = [];
+  TRACKING_TYPES.forEach((type) => {
+    const btn = el('button', `btn small ${type.id === selectedTrackingType ? 'primary' : 'secondary'}`, type.label);
+    btn.onclick = () => {
+      selectedTrackingType = type.id;
+      typeButtons.forEach(({ button, id }) => {
+        button.className = `btn small ${id === selectedTrackingType ? 'primary' : 'secondary'}`;
+      });
+    };
+    typeButtons.push({ button: btn, id: type.id });
+    typeRow.appendChild(btn);
+  });
+  content.appendChild(typeRow);
+
+  content.appendChild(el('div', 'field-label', 'Category'));
+  const categorySelect = document.createElement('select');
+  categorySelect.className = 'select-input';
+  EXERCISE_CATEGORIES.forEach((category) => {
+    const option = new Option(category.label, category.id);
+    if (category.id === (existing ? existing.category : 'uncategorized')) option.selected = true;
+    categorySelect.appendChild(option);
+  });
+  content.appendChild(categorySelect);
+
+  content.appendChild(el('div', 'field-label', 'Icon'));
   let selectedIcon = existing ? existing.icon : ICONS[0];
   const iconGrid = el('div', 'icon-grid');
   ICONS.forEach((icon) => {
@@ -479,9 +612,13 @@ function openExerciseModal(existing) {
     const name = nameInput.value.trim();
     if (!name) { nameInput.focus(); return; }
     await Store.put('exercises', {
+      ...(existing || {}),
       id: existing ? existing.id : uid(),
       name,
       icon: selectedIcon,
+      trackingType: selectedTrackingType,
+      category: categorySelect.value,
+      archived: false,
       createdAt: existing ? existing.createdAt : Date.now(),
     });
     await loadAll();
@@ -494,7 +631,7 @@ function openExerciseModal(existing) {
     const delBtn = el('button', 'btn danger', 'Delete exercise');
     delBtn.onclick = async () => {
       if (!confirm(`Delete ${existing.name}? Past logged sets for it will be kept in history but the exercise won't be selectable anymore.`)) return;
-      await Store.delete('exercises', existing.id);
+      await Store.put('exercises', { ...existing, archived: true });
       await loadAll();
       overlay.remove();
       render();
@@ -503,6 +640,72 @@ function openExerciseModal(existing) {
   }
 
   const overlay = modal(content);
+}
+
+function exercisePicker({ selected = new Set(), excludedIds = new Set(), onSingleSelect = null } = {}) {
+  const wrap = el('div', 'exercise-picker');
+  const controls = el('div', 'exercise-filters');
+  const searchInput = document.createElement('input');
+  searchInput.type = 'search';
+  searchInput.className = 'text-input';
+  searchInput.placeholder = 'Search exercises';
+  searchInput.setAttribute('aria-label', 'Search exercises');
+  controls.appendChild(searchInput);
+
+  const categoryFilter = document.createElement('select');
+  categoryFilter.className = 'select-input';
+  categoryFilter.setAttribute('aria-label', 'Filter exercises by category');
+  categoryFilter.appendChild(new Option('All categories', 'all'));
+  EXERCISE_CATEGORIES.forEach((category) => categoryFilter.appendChild(new Option(category.label, category.id)));
+  controls.appendChild(categoryFilter);
+  wrap.appendChild(controls);
+
+  const list = el('div', 'exercise-select-list');
+  wrap.appendChild(list);
+
+  const refresh = () => {
+    list.innerHTML = '';
+    const query = searchInput.value.trim().toLocaleLowerCase();
+    const selectedCategory = categoryFilter.value;
+    const matches = activeExercises().filter((exercise) =>
+      !excludedIds.has(exercise.id)
+      && (selectedCategory === 'all' || exercise.category === selectedCategory)
+      && (!query || exercise.name.toLocaleLowerCase().includes(query))
+    );
+
+    EXERCISE_CATEGORIES.forEach((category) => {
+      const categoryExercises = matches.filter((exercise) => exercise.category === category.id);
+      if (categoryExercises.length === 0) return;
+      list.appendChild(el('div', 'picker-category', category.label));
+      categoryExercises.forEach((exercise) => {
+        const row = el('button', 'select-row' + (selected.has(exercise.id) ? ' selected' : ''));
+        row.appendChild(iconImg(exercise.icon, 24));
+        const details = el('span', 'row-details');
+        details.appendChild(el('span', 'row-label', exercise.name));
+        details.appendChild(el('span', 'row-meta', isBodyweightExercise(exercise) ? 'Bodyweight' : 'Weighted'));
+        row.appendChild(details);
+        row.onclick = () => {
+          if (onSingleSelect) {
+            onSingleSelect(exercise);
+            return;
+          }
+          if (selected.has(exercise.id)) {
+            selected.delete(exercise.id);
+            row.classList.remove('selected');
+          } else {
+            selected.add(exercise.id);
+            row.classList.add('selected');
+          }
+        };
+        list.appendChild(row);
+      });
+    });
+    if (matches.length === 0) list.appendChild(el('p', 'empty-state', 'No exercises match your search.'));
+  };
+  searchInput.oninput = refresh;
+  categoryFilter.onchange = refresh;
+  refresh();
+  return wrap;
 }
 
 // ================= LOG =================
@@ -563,18 +766,7 @@ function openRoutineModal() {
   content.appendChild(nameInput);
 
   const selected = new Set();
-  const grid = el('div', 'exercise-select-list');
-  state.exercises.forEach((ex) => {
-    const row = el('button', 'select-row');
-    row.appendChild(iconImg(ex.icon, 24));
-    row.appendChild(el('span', 'row-label', ex.name));
-    row.onclick = () => {
-      if (selected.has(ex.id)) { selected.delete(ex.id); row.classList.remove('selected'); }
-      else { selected.add(ex.id); row.classList.add('selected'); }
-    };
-    grid.appendChild(row);
-  });
-  content.appendChild(grid);
+  content.appendChild(exercisePicker({ selected }));
 
   const saveBtn = el('button', 'btn primary', 'Save routine');
   saveBtn.onclick = async () => {
@@ -591,6 +783,15 @@ function openRoutineModal() {
 
 // ---- Active session: persistence-backed lifecycle ----
 async function startSession(routineId, exerciseIds) {
+  if (!profileById(state.activeProfileId)) {
+    state.activeProfileId = null;
+    state.activeSession = null;
+    render();
+    alert('Create or select a profile before starting a workout.');
+    return;
+  }
+  const selectableIds = new Set(activeExercises().map((exercise) => exercise.id));
+  const uniqueExerciseIds = [...new Set(exerciseIds || [])].filter((id) => selectableIds.has(id));
   const now = Date.now();
   const session = {
     id: uid(),
@@ -598,7 +799,7 @@ async function startSession(routineId, exerciseIds) {
     date: state.selectedLogDate || todayISO(),
     routineId: routineId || null,
     status: 'in_progress',
-    exerciseIds: exerciseIds ? [...exerciseIds] : [],
+    exerciseIds: uniqueExerciseIds,
     createdAt: now,
   };
   await Store.put('sessions', session);
@@ -607,7 +808,7 @@ async function startSession(routineId, exerciseIds) {
     date: session.date,
     routineId: session.routineId,
     createdAt: now,
-    exercises: (exerciseIds || []).map((eid) => ({ exerciseId: eid, sets: [] })),
+    exercises: uniqueExerciseIds.map((eid) => ({ exerciseId: eid, sets: [] })),
   };
   render();
 }
@@ -626,6 +827,7 @@ async function persistSessionShell() {
 }
 
 async function addExerciseToActiveSession(exerciseId) {
+  if (state.activeSession.exercises.some((entry) => entry.exerciseId === exerciseId)) return;
   state.activeSession.exercises.push({ exerciseId, sets: [] });
   await persistSessionShell();
   render();
@@ -643,6 +845,8 @@ async function removeExerciseFromActiveSession(idx) {
 
 async function addSetToExercise(exEntry) {
   const last = exEntry.sets[exEntry.sets.length - 1];
+  const exercise = exerciseById(exEntry.exerciseId);
+  const bodyweight = isBodyweightExercise(exercise);
   const newSet = {
     id: uid(),
     profileId: state.activeProfileId,
@@ -650,7 +854,7 @@ async function addSetToExercise(exEntry) {
     exerciseId: exEntry.exerciseId,
     date: state.activeSession.date,
     setNumber: exEntry.sets.length + 1,
-    weight: last ? last.weight : 0,
+    weight: bodyweight ? null : (last && Number.isFinite(last.weight) ? last.weight : 0),
     reps: last ? last.reps : 0,
     createdAt: Date.now(),
   };
@@ -667,6 +871,10 @@ async function deleteSetAt(exEntry, idx) {
   const s = exEntry.sets[idx];
   if (s.id) await Store.delete('sets', s.id);
   exEntry.sets.splice(idx, 1);
+  await Promise.all(exEntry.sets.map((set, index) => {
+    set.setNumber = index + 1;
+    return persistSet(set);
+  }));
   render();
 }
 
@@ -685,53 +893,71 @@ function activeSessionView() {
   session.exercises.forEach((exEntry, exIdx) => {
     const ex = exerciseById(exEntry.exerciseId);
     if (!ex) return;
+    const bodyweight = isBodyweightExercise(ex);
     const card = el('div', 'exercise-card');
     const head = el('div', 'exercise-card-head');
     head.appendChild(iconImg(ex.icon));
-    head.appendChild(el('span', 'row-label', ex.name));
+    const exerciseDetails = el('span', 'row-details');
+    exerciseDetails.appendChild(el('span', 'row-label', ex.name));
+    exerciseDetails.appendChild(el('span', 'row-meta', bodyweight ? 'Bodyweight' : 'Weighted'));
+    head.appendChild(exerciseDetails);
     const removeExBtn = el('button', 'icon-btn', '✕');
+    removeExBtn.setAttribute('aria-label', `Remove ${ex.name} from workout`);
     removeExBtn.onclick = () => removeExerciseFromActiveSession(exIdx);
     head.appendChild(removeExBtn);
     card.appendChild(head);
 
     const setsList = el('div', 'sets-list');
-    const setHeaderRow = el('div', 'set-row set-header');
+    const setHeaderRow = el('div', 'set-row set-header' + (bodyweight ? ' bodyweight' : ''));
     setHeaderRow.appendChild(el('span', 'set-col', 'Set'));
-    setHeaderRow.appendChild(el('span', 'set-col', `Weight (${state.unit})`));
+    if (!bodyweight) setHeaderRow.appendChild(el('span', 'set-col', `Weight (${state.unit})`));
     setHeaderRow.appendChild(el('span', 'set-col', 'Reps'));
     setHeaderRow.appendChild(el('span', 'set-col', ''));
     setsList.appendChild(setHeaderRow);
 
     exEntry.sets.forEach((s, setIdx) => {
-      const row = el('div', 'set-row');
+      const row = el('div', 'set-row' + (bodyweight ? ' bodyweight' : ''));
       row.appendChild(el('span', 'set-col', String(setIdx + 1)));
 
-      const weightInput = document.createElement('input');
-      weightInput.type = 'number';
-      weightInput.inputMode = 'decimal';
-      weightInput.className = 'set-input';
-      weightInput.value = roundNice(toDisplay(s.weight));
-      weightInput.onchange = async () => {
-        const entered = parseFloat(weightInput.value) || 0;
-        s.weight = toStoredLbs(entered, state.unit);
-        await persistSet(s);
-      };
-      const wCol = el('span', 'set-col'); wCol.appendChild(weightInput);
-      row.appendChild(wCol);
+      if (!bodyweight) {
+        const weightInput = document.createElement('input');
+        weightInput.type = 'number';
+        weightInput.inputMode = 'decimal';
+        weightInput.min = '0';
+        weightInput.step = 'any';
+        weightInput.className = 'set-input';
+        weightInput.setAttribute('aria-label', `${ex.name} set ${setIdx + 1} weight in ${state.unit}`);
+        weightInput.value = roundNice(toDisplay(s.weight));
+        weightInput.onchange = async () => {
+          const entered = Number(weightInput.value);
+          const validValue = Number.isFinite(entered) && entered >= 0 ? entered : 0;
+          weightInput.value = String(validValue);
+          s.weight = toStoredLbs(validValue, state.unit);
+          await persistSet(s);
+        };
+        const wCol = el('span', 'set-col'); wCol.appendChild(weightInput);
+        row.appendChild(wCol);
+      }
 
       const repsInput = document.createElement('input');
       repsInput.type = 'number';
       repsInput.inputMode = 'numeric';
+      repsInput.min = '0';
+      repsInput.step = '1';
       repsInput.className = 'set-input';
+      repsInput.setAttribute('aria-label', `${ex.name} set ${setIdx + 1} reps`);
       repsInput.value = s.reps;
       repsInput.onchange = async () => {
-        s.reps = parseInt(repsInput.value) || 0;
+        const entered = Number(repsInput.value);
+        s.reps = Number.isFinite(entered) && entered >= 0 ? Math.floor(entered) : 0;
+        repsInput.value = String(s.reps);
         await persistSet(s);
       };
       const rCol = el('span', 'set-col'); rCol.appendChild(repsInput);
       row.appendChild(rCol);
 
       const delSetBtn = el('button', 'icon-btn small', '✕');
+      delSetBtn.setAttribute('aria-label', `Delete ${ex.name} set ${setIdx + 1}`);
       delSetBtn.onclick = () => deleteSetAt(exEntry, setIdx);
       const dCol = el('span', 'set-col'); dCol.appendChild(delSetBtn);
       row.appendChild(dCol);
@@ -751,18 +977,14 @@ function activeSessionView() {
   addExerciseBtn.onclick = () => {
     const content = el('div');
     content.appendChild(el('h3', 'modal-title', 'Add exercise'));
-    const grid = el('div', 'exercise-select-list');
-    state.exercises.forEach((ex) => {
-      const row = el('button', 'select-row');
-      row.appendChild(iconImg(ex.icon, 24));
-      row.appendChild(el('span', 'row-label', ex.name));
-      row.onclick = async () => {
+    const excludedIds = new Set(session.exercises.map((entry) => entry.exerciseId));
+    content.appendChild(exercisePicker({
+      excludedIds,
+      onSingleSelect: async (exercise) => {
         overlay.remove();
-        await addExerciseToActiveSession(ex.id);
-      };
-      grid.appendChild(row);
-    });
-    content.appendChild(grid);
+        await addExerciseToActiveSession(exercise.id);
+      },
+    }));
     const overlay = modal(content);
   };
   wrap.appendChild(addExerciseBtn);
@@ -832,7 +1054,14 @@ function historyScreen() {
   mySessions.forEach((session) => {
     const sessionSets = state.sets.filter((s) => s.sessionId === session.id);
     const exerciseIds = [...new Set(sessionSets.map((s) => s.exerciseId))];
-    const totalVolumeLbs = sessionSets.reduce((sum, s) => sum + s.weight * s.reps, 0);
+    const weightedVolumeLbs = sessionSets.reduce((sum, set) => {
+      const exercise = exerciseById(set.exerciseId);
+      return isBodyweightExercise(exercise) ? sum : sum + setVolume(set, exercise);
+    }, 0);
+    const bodyweightReps = sessionSets.reduce((sum, set) => {
+      const exercise = exerciseById(set.exerciseId);
+      return isBodyweightExercise(exercise) ? sum + set.reps : sum;
+    }, 0);
 
     const row = el('div', 'history-row');
     row.style.cursor = 'pointer';
@@ -840,7 +1069,10 @@ function historyScreen() {
 
     const dateRow = el('div', 'history-date-row');
     dateRow.appendChild(el('span', 'history-date', fmtDate(session.date)));
-    dateRow.appendChild(el('span', 'history-volume', `${roundNice(toDisplay(totalVolumeLbs)).toLocaleString()} ${state.unit} vol`));
+    const summaryParts = [];
+    if (weightedVolumeLbs > 0) summaryParts.push(`${roundNice(toDisplay(weightedVolumeLbs)).toLocaleString()} ${state.unit} vol`);
+    if (bodyweightReps > 0) summaryParts.push(`${bodyweightReps.toLocaleString()} reps`);
+    dateRow.appendChild(el('span', 'history-volume', summaryParts.join(' · ') || 'No volume'));
     row.appendChild(dateRow);
 
     const chips = el('div', 'exercise-chips');
@@ -934,14 +1166,25 @@ function openWorkoutDetailModal(session) {
 
   const sessionSets = state.sets.filter((s) => s.sessionId === session.id);
   const exerciseIds = [...new Set(sessionSets.map((s) => s.exerciseId))];
-  const totalVolumeLbs = sessionSets.reduce((sum, s) => sum + s.weight * s.reps, 0);
+  const weightedVolumeLbs = sessionSets.reduce((sum, set) => {
+    const exercise = exerciseById(set.exerciseId);
+    return isBodyweightExercise(exercise) ? sum : sum + setVolume(set, exercise);
+  }, 0);
+  const bodyweightReps = sessionSets.reduce((sum, set) => {
+    const exercise = exerciseById(set.exerciseId);
+    return isBodyweightExercise(exercise) ? sum + set.reps : sum;
+  }, 0);
 
-  content.appendChild(el('p', 'field-hint', `Total volume: ${roundNice(toDisplay(totalVolumeLbs)).toLocaleString()} ${state.unit}`));
+  const workoutSummary = [];
+  if (weightedVolumeLbs > 0) workoutSummary.push(`Weighted volume: ${roundNice(toDisplay(weightedVolumeLbs)).toLocaleString()} ${state.unit}`);
+  if (bodyweightReps > 0) workoutSummary.push(`Bodyweight volume: ${bodyweightReps.toLocaleString()} reps`);
+  content.appendChild(el('p', 'field-hint', workoutSummary.join(' · ') || 'No volume recorded'));
 
   exerciseIds.forEach((eid) => {
     const ex = exerciseById(eid);
+    const bodyweight = isBodyweightExercise(ex);
     const exSets = sessionSets.filter((s) => s.exerciseId === eid).sort((a, b) => (a.setNumber || 0) - (b.setNumber || 0));
-    const exVolumeLbs = exSets.reduce((sum, s) => sum + s.weight * s.reps, 0);
+    const exerciseVolume = exSets.reduce((sum, set) => sum + setVolume(set, ex), 0);
 
     const card = el('div', 'exercise-card');
     const head = el('div', 'exercise-card-head');
@@ -950,21 +1193,27 @@ function openWorkoutDetailModal(session) {
     card.appendChild(head);
 
     const setsList = el('div', 'sets-list');
-    const setHeaderRow = el('div', 'set-row set-header');
+    const setHeaderRow = el('div', `set-row set-header read-only ${bodyweight ? 'history-bodyweight' : 'history-weighted'}`);
     setHeaderRow.appendChild(el('span', 'set-col', 'Set'));
-    setHeaderRow.appendChild(el('span', 'set-col', `Weight (${state.unit})`));
+    if (!bodyweight) setHeaderRow.appendChild(el('span', 'set-col', `Weight (${state.unit})`));
     setHeaderRow.appendChild(el('span', 'set-col', 'Reps'));
     setsList.appendChild(setHeaderRow);
 
     exSets.forEach((s, idx) => {
-      const row = el('div', 'set-row read-only');
+      const row = el('div', `set-row read-only ${bodyweight ? 'history-bodyweight' : 'history-weighted'}`);
       row.appendChild(el('span', 'set-col', String(idx + 1)));
-      row.appendChild(el('span', 'set-col', String(roundNice(toDisplay(s.weight)))));
+      if (!bodyweight) row.appendChild(el('span', 'set-col', String(roundNice(toDisplay(s.weight)))));
       row.appendChild(el('span', 'set-col', String(s.reps)));
       setsList.appendChild(row);
     });
     card.appendChild(setsList);
-    card.appendChild(el('p', 'field-hint', `Exercise volume: ${roundNice(toDisplay(exVolumeLbs)).toLocaleString()} ${state.unit}`));
+    card.appendChild(el(
+      'p',
+      'field-hint',
+      bodyweight
+        ? `Exercise volume: ${exerciseVolume.toLocaleString()} reps`
+        : `Exercise volume: ${roundNice(toDisplay(exerciseVolume)).toLocaleString()} ${state.unit}`
+    ));
 
     content.appendChild(card);
   });
@@ -977,27 +1226,30 @@ function rangeStartDate(range) {
   if (range === '7d') return isoDaysAgo(7);
   if (range === '30d') return isoDaysAgo(30);
   if (range === '1y') return isoDaysAgo(365);
-  if (range === 'ytd') return `${new Date().getFullYear()}-01-01`;
+  if (range === 'ytd') return `${todayISO().slice(0, 4)}-01-01`;
   return null; // all
 }
 
-function aggregateByDate(sets, metric) {
-  const byDate = {};
-  sets.forEach((s) => {
-    const val = metric === 'weight' ? s.weight : s.weight * s.reps;
-    if (!(s.date in byDate)) byDate[s.date] = metric === 'weight' ? -Infinity : 0;
-    byDate[s.date] = metric === 'weight' ? Math.max(byDate[s.date], val) : byDate[s.date] + val;
-  });
-  return byDate;
+function completedSetsFor(profileId, exerciseId = null) {
+  const completedSessionIds = new Set(
+    state.sessions
+      .filter((session) => session.profileId === profileId && isCompleted(session))
+      .map((session) => session.id)
+  );
+  return state.sets.filter((set) =>
+    set.profileId === profileId
+    && completedSessionIds.has(set.sessionId)
+    && (exerciseId === null || set.exerciseId === exerciseId)
+  );
 }
 
-function computePctChange() {
+function computePctChange(exercise) {
   const rangeStart = rangeStartDate(state.progressRange);
-  let sets = state.sets.filter((s) => s.profileId === state.activeProfileId && s.exerciseId === state.progressExerciseId);
+  let sets = completedSetsFor(state.activeProfileId, state.progressExerciseId);
   if (rangeStart) sets = sets.filter((s) => s.date >= rangeStart);
   if (sets.length === 0) return null;
 
-  const byDate = aggregateByDate(sets, state.progressMetric);
+  const byDate = aggregateByDate(sets, state.progressMetric, exercise);
   const dates = Object.keys(byDate).sort();
   if (dates.length < 2) return null;
 
@@ -1011,28 +1263,45 @@ function progressScreen() {
   const wrap = el('div', 'section');
   wrap.appendChild(el('h2', 'section-title', 'Progress'));
 
-  if (state.exercises.length === 0) {
+  const selectableExercises = activeExercises();
+  if (selectableExercises.length === 0) {
     wrap.appendChild(el('p', 'empty-state', 'Add exercises first to see progress.'));
     return wrap;
   }
 
-  if (!state.progressExerciseId) state.progressExerciseId = state.exercises[0].id;
+  if (!selectableExercises.some((exercise) => exercise.id === state.progressExerciseId)) {
+    state.progressExerciseId = selectableExercises[0].id;
+  }
+  state.progressProfileIds = state.progressProfileIds.filter((id) => profileById(id));
   if (state.progressProfileIds.length === 0) state.progressProfileIds = [state.activeProfileId];
+  const selectedExercise = exerciseById(state.progressExerciseId);
+  const bodyweight = isBodyweightExercise(selectedExercise);
+  if (bodyweight) state.progressMetric = 'volume';
 
   const exSelect = document.createElement('select');
   exSelect.className = 'select-input';
-  state.exercises.forEach((ex) => {
-    const opt = document.createElement('option');
-    opt.value = ex.id;
-    opt.textContent = ex.name;
-    if (ex.id === state.progressExerciseId) opt.selected = true;
-    exSelect.appendChild(opt);
+  EXERCISE_CATEGORIES.forEach((category) => {
+    const groupExercises = selectableExercises.filter((exercise) => exercise.category === category.id);
+    if (groupExercises.length === 0) return;
+    const group = document.createElement('optgroup');
+    group.label = category.label;
+    groupExercises.forEach((exercise) => {
+      const option = new Option(exercise.name, exercise.id);
+      if (exercise.id === state.progressExerciseId) option.selected = true;
+      group.appendChild(option);
+    });
+    exSelect.appendChild(group);
   });
-  exSelect.onchange = () => { state.progressExerciseId = exSelect.value; render(); };
+  exSelect.onchange = () => {
+    state.progressExerciseId = exSelect.value;
+    if (isBodyweightExercise(exerciseById(exSelect.value))) state.progressMetric = 'volume';
+    render();
+  };
   wrap.appendChild(exSelect);
 
   const metricRow = el('div', 'btn-row');
-  ['weight', 'volume'].forEach((m) => {
+  const metrics = bodyweight ? ['volume'] : ['weight', 'volume'];
+  metrics.forEach((m) => {
     const btn = el('button', 'btn small ' + (state.progressMetric === m ? 'primary' : 'secondary'), m === 'weight' ? 'Weight' : 'Volume');
     btn.onclick = () => { state.progressMetric = m; render(); };
     metricRow.appendChild(btn);
@@ -1047,7 +1316,7 @@ function progressScreen() {
   });
   wrap.appendChild(rangeRow);
 
-  const pct = computePctChange();
+  const pct = computePctChange(selectedExercise);
   if (pct !== null) {
     const positive = pct >= 0;
     const ticker = el('div', 'pct-ticker ' + (positive ? 'positive' : 'negative'));
@@ -1082,18 +1351,23 @@ function progressScreen() {
   canvasWrap.appendChild(canvas);
   wrap.appendChild(canvasWrap);
 
-  const mySets = state.sets.filter((s) => s.profileId === state.activeProfileId);
+  const mySets = completedSetsFor(state.activeProfileId, state.progressExerciseId);
   const mySessions = state.sessions.filter((s) => s.profileId === state.activeProfileId && isCompleted(s));
-  const totalVolumeLbs = mySets.reduce((sum, s) => sum + s.weight * s.reps, 0);
+  const totalVolume = mySets.reduce((sum, set) => sum + setVolume(set, selectedExercise), 0);
   const statsRow = el('div', 'stats-row');
   statsRow.appendChild(statCard('Workouts', mySessions.length));
-  statsRow.appendChild(statCard(`Total volume (${state.unit})`, roundNice(toDisplay(totalVolumeLbs)).toLocaleString()));
+  statsRow.appendChild(statCard(
+    bodyweight ? 'Exercise volume (reps)' : `Exercise volume (${state.unit})`,
+    roundNice(bodyweight ? totalVolume : toDisplay(totalVolume)).toLocaleString()
+  ));
   wrap.appendChild(statsRow);
 
-  const exSets = mySets.filter((s) => s.exerciseId === state.progressExerciseId);
-  if (exSets.length > 0) {
-    const maxWeightLbs = Math.max(...exSets.map((s) => s.weight));
-    wrap.appendChild(el('p', 'pr-badge', `\uD83C\uDFC6 PR: ${roundNice(toDisplay(maxWeightLbs))} ${state.unit} on ${exerciseById(state.progressExerciseId).name}`));
+  if (mySets.length > 0) {
+    const personalRecord = bodyweight
+      ? Math.max(...mySets.map((set) => set.reps))
+      : roundNice(toDisplay(Math.max(...mySets.map((set) => set.weight))));
+    const unitLabel = bodyweight ? 'reps' : state.unit;
+    wrap.appendChild(el('p', 'pr-badge', `\uD83C\uDFC6 PR: ${personalRecord} ${unitLabel} on ${selectedExercise.name}`));
   }
 
   requestAnimationFrame(() => drawProgressChart(canvas));
@@ -1114,15 +1388,20 @@ function drawProgressChart(canvas) {
   const exerciseId = state.progressExerciseId;
   const metric = state.progressMetric;
   const rangeStart = rangeStartDate(state.progressRange);
+  const exercise = exerciseById(exerciseId);
+  const bodyweight = isBodyweightExercise(exercise);
 
   const datasets = state.progressProfileIds.map((pid) => {
     const profile = profileById(pid);
-    let sets = state.sets.filter((s) => s.profileId === pid && s.exerciseId === exerciseId);
+    let sets = completedSetsFor(pid, exerciseId);
     if (rangeStart) sets = sets.filter((s) => s.date >= rangeStart);
     sets = sets.sort((a, b) => a.date.localeCompare(b.date));
 
-    const byDate = aggregateByDate(sets, metric);
-    const points = Object.keys(byDate).sort().map((d) => ({ x: d, y: roundNice(toDisplay(byDate[d])) }));
+    const byDate = aggregateByDate(sets, metric, exercise);
+    const points = Object.keys(byDate).sort().map((date) => ({
+      x: date,
+      y: roundNice(bodyweight ? byDate[date] : toDisplay(byDate[date])),
+    }));
     return {
       label: profile ? profile.name : 'Unknown',
       data: points,
@@ -1143,7 +1422,16 @@ function drawProgressChart(canvas) {
       },
       scales: {
         x: { type: 'time', time: { unit: 'day' }, ticks: { color: '#94a3b8' }, grid: { color: '#334155' } },
-        y: { ticks: { color: '#94a3b8' }, grid: { color: '#334155' }, title: { display: true, text: state.unit, color: '#94a3b8' } },
+        y: {
+          beginAtZero: bodyweight,
+          ticks: { color: '#94a3b8' },
+          grid: { color: '#334155' },
+          title: {
+            display: true,
+            text: bodyweight ? 'Reps' : (metric === 'weight' ? state.unit : `Volume (${state.unit})`),
+            color: '#94a3b8',
+          },
+        },
       },
     },
   });
