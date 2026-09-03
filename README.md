@@ -8,12 +8,36 @@ device unless you export a backup file yourself.
 - Multiple profiles (log workouts for more than one person)
 - Freeform logging or reusable routines/templates
 - Per-set weight + reps (each set can differ)
-- Editable exercise library with custom icons
-- History of past workouts
+- Weighted and bodyweight exercise tracking — bodyweight movements record sets
+  and reps without a weight field
+- Exercise categories, category filters, and name search
+- kg/lbs unit toggle — data is always stored consistently; switching units
+  only changes how numbers are displayed, including on charts
+- Editable exercise library with custom icons (21 built-in exercises)
+- In-progress workouts persist automatically — close the app mid-workout and
+  it picks back up right where you left off, no matter how much later you
+  return
+- Log a workout on a past date via the date picker on the Log screen
+- History with a calendar view (see which days you trained at a glance) plus
+  a per-workout detail view (exercises, weight, and reps per set)
 - Progress charts per exercise: weight or volume (sets×reps×weight) over time,
-  with an option to overlay multiple profiles on the same chart
+  with a rolling time-range selector (7 days / 30 days / 1 year / year-to-date
+  / all time) and a stock-ticker-style % change indicator
 - Personal record (PR) badges
+- Multi-profile overlay on progress charts (compare users on one chart)
 - Export / import your data as a backup file
+- Validated, transaction-safe backup imports with merge and replace options
+
+## Version 3
+
+- Added weighted and bodyweight exercise modes.
+- Added Shoulders, Chest, Arms, Back, Legs, and Abs categories, plus an
+  Uncategorized fallback for existing custom exercises.
+- Added exercise search and category filters throughout the app.
+- Corrected local workout dates, completed-workout progress calculations,
+  duplicate exercise handling, last-profile deletion, and cache isolation.
+- Upgraded backup imports with validation, relationship checks, merge/replace
+  previews, and transaction rollback on failure.
 
 ## Deploy to GitHub Pages
 

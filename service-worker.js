@@ -1,11 +1,13 @@
 // service-worker.js — Iron Log offline support
-const CACHE_NAME = 'iron-log-v4';
+const CACHE_PREFIX = 'iron-log-';
+const CACHE_NAME = 'iron-log-v5';
 
 const APP_SHELL = [
   './',
   './index.html',
   './manifest.json',
   './css/styles.css',
+  './js/domain.js',
   './js/db.js',
   './js/app.js',
   './icons/app-icon-192.png',
@@ -38,7 +40,11 @@ self.addEventListener('install', (event) => {
 self.addEventListener('activate', (event) => {
   event.waitUntil(
     caches.keys().then((keys) =>
-      Promise.all(keys.filter((k) => k !== CACHE_NAME).map((k) => caches.delete(k)))
+      Promise.all(
+        keys
+          .filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE_NAME)
+          .map((key) => caches.delete(key))
+      )
     ).then(() => self.clients.claim())
   );
 });
