@@ -1,6 +1,6 @@
 // service-worker.js — Iron Log offline support
 const CACHE_PREFIX = 'iron-log-';
-const CACHE_NAME = 'iron-log-v5';
+const CACHE_NAME = 'iron-log-v6';
 
 const APP_SHELL = [
   './',

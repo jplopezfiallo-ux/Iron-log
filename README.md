@@ -17,13 +17,20 @@ device unless you export a backup file yourself.
 - In-progress workouts persist automatically — close the app mid-workout and
   it picks back up right where you left off, no matter how much later you
   return
+- Sticky rest stopwatch with start, stop, reset, an optional configurable
+  vibration alert, and screen wake-lock support where the phone allows it
+- Automatic workout duration tracking with an editable duration at finish and
+  duration details in History
+- Drag or keyboard reordering for exercises in saved routines and active workouts
 - Log a workout on a past date via the date picker on the Log screen
 - History with a calendar view (see which days you trained at a glance) plus
-  a per-workout detail view (exercises, weight, and reps per set)
-- Progress charts per exercise: weight or volume (sets×reps×weight) over time,
-  with a rolling time-range selector (7 days / 30 days / 1 year / year-to-date
-  / all time) and a stock-ticker-style % change indicator
-- Personal record (PR) badges
+  a per-workout detail view (duration, exercises, weight, and reps per set)
+- Daily body-weight logging with one editable entry per profile and date,
+  stored consistently across the kg/lbs display toggle
+- Focused Trends charts for estimated 1RM, top weight, best set reps, workout
+  volume, and body weight with a seven-day moving average
+- Records view with workout milestones, training totals, exercise PRs,
+  estimated 1RM, and best-session volume
 - Multi-profile overlay on progress charts (compare users on one chart)
 - Export / import your data as a backup file
 - Validated, transaction-safe backup imports with merge and replace options
@@ -38,6 +45,16 @@ device unless you export a backup file yourself.
   duplicate exercise handling, last-profile deletion, and cache isolation.
 - Upgraded backup imports with validation, relationship checks, merge/replace
   previews, and transaction rollback on failure.
+
+## Version 4
+
+- Added a persistent, pinned rest stopwatch with an optional vibration alert.
+- Added automatic workout duration tracking and History display.
+- Added routine editing and exercise reordering for routines and live workouts.
+- Split Progress into focused Trends and Records views, including Epley
+  estimated 1RM values for weighted sets of 1–10 reps.
+- Added daily body-weight logging and seven-day moving-average charts.
+- Extended backup validation and import/export to include body-weight entries.
 
 ## Deploy to GitHub Pages
 

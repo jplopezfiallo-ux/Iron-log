@@ -65,6 +65,55 @@ function aggregateByDate(sets, metric, exercise) {
   return byDate;
 }
 
+function estimatedOneRepMax(weight, reps) {
+  const parsedWeight = Number(weight);
+  const parsedReps = Number(reps);
+  if (!Number.isFinite(parsedWeight) || parsedWeight <= 0) return null;
+  if (!Number.isInteger(parsedReps) || parsedReps < 1 || parsedReps > 10) return null;
+  if (parsedReps === 1) return parsedWeight;
+  return parsedWeight * (1 + parsedReps / 30);
+}
+
+function sessionDurationMs(session) {
+  if (!session) return null;
+  if (Number.isFinite(session.durationSeconds) && session.durationSeconds >= 0) {
+    return session.durationSeconds * 1000;
+  }
+  const startedAt = Number.isFinite(session.startedAt) ? session.startedAt : session.createdAt;
+  if (!Number.isFinite(startedAt) || !Number.isFinite(session.completedAt) || session.completedAt < startedAt) return null;
+  return session.completedAt - startedAt;
+}
+
+function rollingAverageByDate(entries, windowDays = 7) {
+  const valid = entries
+    .filter((entry) => entry && typeof entry.date === 'string' && Number.isFinite(Number(entry.weight)))
+    .map((entry) => ({ date: entry.date, weight: Number(entry.weight) }))
+    .sort((a, b) => a.date.localeCompare(b.date));
+  const days = Math.max(1, Math.floor(Number(windowDays) || 1));
+  return valid.map((entry, index) => {
+    const end = Date.parse(`${entry.date}T00:00:00Z`);
+    const start = end - ((days - 1) * 86400000);
+    const windowEntries = valid.slice(0, index + 1).filter((candidate) => {
+      const timestamp = Date.parse(`${candidate.date}T00:00:00Z`);
+      return timestamp >= start && timestamp <= end;
+    });
+    return {
+      date: entry.date,
+      weight: entry.weight,
+      average: windowEntries.reduce((sum, candidate) => sum + candidate.weight, 0) / windowEntries.length,
+    };
+  });
+}
+
+function moveArrayItem(items, fromIndex, toIndex) {
+  const next = [...items];
+  if (!Number.isInteger(fromIndex) || !Number.isInteger(toIndex)) return next;
+  if (fromIndex < 0 || fromIndex >= next.length || toIndex < 0 || toIndex >= next.length || fromIndex === toIndex) return next;
+  const [item] = next.splice(fromIndex, 1);
+  next.splice(toIndex, 0, item);
+  return next;
+}
+
 return {
   EXERCISE_CATEGORIES,
   TRACKING_TYPES,
@@ -74,5 +123,9 @@ return {
   isBodyweightExercise,
   setVolume,
   aggregateByDate,
+  estimatedOneRepMax,
+  sessionDurationMs,
+  rollingAverageByDate,
+  moveArrayItem,
 };
 });

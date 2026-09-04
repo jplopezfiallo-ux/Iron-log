@@ -8,9 +8,9 @@
 
 
 const DB_NAME = 'iron-log';
-const DB_VERSION = 1;
-const SCHEMA_VERSION = 3; // app-level record shape version, independent of IDB version
-const DATA_STORES = ['profiles', 'exercises', 'routines', 'sessions', 'sets'];
+const DB_VERSION = 2;
+const SCHEMA_VERSION = 4; // app-level record shape version, independent of IDB version
+const DATA_STORES = ['profiles', 'exercises', 'routines', 'sessions', 'sets', 'bodyWeights'];
 const { EXERCISE_CATEGORIES, TRACKING_TYPES } = window.IronLogDomain;
 const VALID_CATEGORY_IDS = new Set(EXERCISE_CATEGORIES.map((category) => category.id));
 const VALID_TRACKING_TYPES = new Set(TRACKING_TYPES.map((type) => type.id));
@@ -69,6 +69,13 @@ function openDB() {
         store.createIndex('sessionId', 'sessionId');
         store.createIndex('date', 'date');
         store.createIndex('profileExercise', ['profileId', 'exerciseId']);
+      }
+
+      if (!db.objectStoreNames.contains('bodyWeights')) {
+        const store = db.createObjectStore('bodyWeights', { keyPath: 'id' });
+        store.createIndex('profileId', 'profileId');
+        store.createIndex('date', 'date');
+        store.createIndex('profileDate', ['profileId', 'date'], { unique: true });
       }
 
       if (!db.objectStoreNames.contains('meta')) {
@@ -218,18 +225,19 @@ async function seedIfEmpty() {
 
 // ---- Export / Import ----
 async function exportAllData() {
-  const [profiles, exercises, routines, sessions, sets] = await Promise.all([
+  const [profiles, exercises, routines, sessions, sets, bodyWeights] = await Promise.all([
     DB.getAll('profiles'),
     DB.getAll('exercises'),
     DB.getAll('routines'),
     DB.getAll('sessions'),
     DB.getAll('sets'),
+    DB.getAll('bodyWeights'),
   ]);
   return {
     app: 'iron-log',
     schemaVersion: SCHEMA_VERSION,
     exportedAt: new Date().toISOString(),
-    data: { profiles, exercises, routines, sessions, sets },
+    data: { profiles, exercises, routines, sessions, sets, bodyWeights },
   };
 }
 
@@ -276,8 +284,10 @@ function validateBackupPayload(payload) {
 
   const data = {};
   DATA_STORES.forEach((storeName) => {
-    assertBackup(Array.isArray(payload.data[storeName]), `Backup ${storeName} must be an array`);
-    data[storeName] = payload.data[storeName].map((record) => ({ ...record }));
+    const records = payload.data[storeName];
+    const canDefaultMissingStore = version < 4 && storeName === 'bodyWeights' && records === undefined;
+    assertBackup(canDefaultMissingStore || Array.isArray(records), `Backup ${storeName} must be an array`);
+    data[storeName] = (canDefaultMissingStore ? [] : records).map((record) => ({ ...record }));
     assertUniqueIds(data[storeName], storeName);
   });
 
@@ -310,7 +320,18 @@ function validateBackupPayload(payload) {
     assertBackup(session.status === undefined || ['in_progress', 'completed'].includes(session.status), `Session ${session.id} has an invalid status`);
     assertBackup(Array.isArray(session.exerciseIds) && session.exerciseIds.every(isId), `Session ${session.id} has invalid exercises`);
     assertBackup(isTimestamp(session.createdAt), `Session ${session.id} has an invalid creation date`);
+    assertBackup(session.startedAt === undefined || isTimestamp(session.startedAt), `Session ${session.id} has an invalid start time`);
     assertBackup(session.completedAt === undefined || isTimestamp(session.completedAt), `Session ${session.id} has an invalid completion date`);
+    assertBackup(session.durationSeconds === undefined || (Number.isInteger(session.durationSeconds) && session.durationSeconds >= 0), `Session ${session.id} has an invalid duration`);
+    if (session.restTimer !== undefined) {
+      assertBackup(isRecord(session.restTimer), `Session ${session.id} has an invalid rest stopwatch`);
+      assertBackup(Number.isInteger(session.restTimer.alertSeconds) && session.restTimer.alertSeconds > 0, `Session ${session.id} has an invalid rest alert`);
+      assertBackup(typeof session.restTimer.vibrate === 'boolean', `Session ${session.id} has an invalid vibration setting`);
+      assertBackup(Number.isFinite(session.restTimer.elapsedMs) && session.restTimer.elapsedMs >= 0, `Session ${session.id} has invalid stopwatch time`);
+      assertBackup(session.restTimer.startedAt === null || isTimestamp(session.restTimer.startedAt), `Session ${session.id} has an invalid stopwatch start`);
+      assertBackup(typeof session.restTimer.running === 'boolean', `Session ${session.id} has an invalid stopwatch state`);
+      assertBackup(typeof session.restTimer.alertFired === 'boolean', `Session ${session.id} has an invalid stopwatch alert state`);
+    }
   });
 
   data.sets.forEach((set) => {
@@ -320,6 +341,20 @@ function validateBackupPayload(payload) {
     assertBackup(set.weight === null || (Number.isFinite(set.weight) && set.weight >= 0), `Set ${set.id} has an invalid weight`);
     assertBackup(Number.isInteger(set.setNumber) && set.setNumber >= 1, `Set ${set.id} has an invalid set number`);
     assertBackup(isTimestamp(set.createdAt), `Set ${set.id} has an invalid creation date`);
+  });
+
+  data.bodyWeights.forEach((entry) => {
+    assertBackup(isId(entry.profileId), `Body weight ${entry.id} has an invalid profile`);
+    assertBackup(isISODate(entry.date), `Body weight ${entry.id} has an invalid date`);
+    assertBackup(Number.isFinite(entry.weight) && entry.weight > 0, `Body weight ${entry.id} has an invalid weight`);
+    assertBackup(isTimestamp(entry.createdAt), `Body weight ${entry.id} has an invalid creation date`);
+    assertBackup(entry.updatedAt === undefined || isTimestamp(entry.updatedAt), `Body weight ${entry.id} has an invalid update date`);
+  });
+  const bodyWeightDates = new Set();
+  data.bodyWeights.forEach((entry) => {
+    const key = `${entry.profileId}:${entry.date}`;
+    assertBackup(!bodyWeightDates.has(key), `Body weights contain duplicate profile/date ${key}`);
+    bodyWeightDates.add(key);
   });
 
   return {
@@ -333,6 +368,12 @@ function validateBackupPayload(payload) {
 function mergeById(existing, incoming) {
   const merged = new Map(existing.map((record) => [record.id, record]));
   incoming.forEach((record) => merged.set(record.id, record));
+  return [...merged.values()];
+}
+
+function mergeBodyWeights(existing, incoming) {
+  const merged = new Map(existing.map((record) => [`${record.profileId}:${record.date}`, record]));
+  incoming.forEach((record) => merged.set(`${record.profileId}:${record.date}`, record));
   return [...merged.values()];
 }
 
@@ -351,6 +392,10 @@ function ensureRelationshipIntegrity(data) {
     assertBackup(session, `Set ${set.id} refers to a missing session`);
     assertBackup(session.profileId === set.profileId, `Set ${set.id} does not match its session profile`);
     assertBackup(session.exerciseIds.includes(set.exerciseId), `Set ${set.id} does not match its session exercises`);
+  });
+
+  data.bodyWeights.forEach((entry) => {
+    assertBackup(profileIds.has(entry.profileId), `Body weight ${entry.id} refers to a missing profile`);
   });
 
   const referencedExerciseIds = new Set();
@@ -382,7 +427,9 @@ async function importAllData(payload, { replace = false } = {}) {
   } else {
     const existingArrays = await Promise.all(DATA_STORES.map((storeName) => DB.getAll(storeName)));
     DATA_STORES.forEach((storeName, index) => {
-      combined[storeName] = mergeById(existingArrays[index], incoming[storeName]);
+      combined[storeName] = storeName === 'bodyWeights'
+        ? mergeBodyWeights(existingArrays[index], incoming[storeName])
+        : mergeById(existingArrays[index], incoming[storeName]);
     });
   }
   ensureRelationshipIntegrity(combined);
@@ -396,6 +443,7 @@ async function importAllData(payload, { replace = false } = {}) {
 
     try {
       if (replace) DATA_STORES.forEach((storeName) => transaction.objectStore(storeName).clear());
+      else transaction.objectStore('bodyWeights').clear();
       DATA_STORES.forEach((storeName) => {
         combined[storeName].forEach((record) => transaction.objectStore(storeName).put(record));
       });

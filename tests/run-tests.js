@@ -45,6 +45,33 @@ test('bodyweight volume sums reps and never uses weight', () => {
   assert.equal(domain.setVolume(sets[0], exercise), 12);
 });
 
+test('Epley estimate accepts weighted sets from one to ten reps', () => {
+  assert.equal(domain.estimatedOneRepMax(225, 1), 225);
+  assert.equal(domain.estimatedOneRepMax(180, 10), 240);
+  assert.equal(domain.estimatedOneRepMax(180, 11), null);
+  assert.equal(domain.estimatedOneRepMax(0, 5), null);
+});
+
+test('session duration prefers an explicit adjusted duration', () => {
+  assert.equal(domain.sessionDurationMs({ startedAt: 1000, completedAt: 61000 }), 60000);
+  assert.equal(domain.sessionDurationMs({ startedAt: 1000, completedAt: 61000, durationSeconds: 90 }), 90000);
+  assert.equal(domain.sessionDurationMs({ startedAt: 61000, completedAt: 1000 }), null);
+});
+
+test('seven-day body-weight average uses calendar days', () => {
+  const result = domain.rollingAverageByDate([
+    { date: '2026-09-01', weight: 180 },
+    { date: '2026-09-02', weight: 182 },
+    { date: '2026-09-09', weight: 178 },
+  ], 7);
+  assert.deepEqual(result.map((entry) => entry.average), [180, 181, 178]);
+});
+
+test('moveArrayItem preserves order while relocating one item', () => {
+  assert.deepEqual(domain.moveArrayItem(['a', 'b', 'c'], 0, 2), ['b', 'c', 'a']);
+  assert.deepEqual(domain.moveArrayItem(['a', 'b'], -1, 1), ['a', 'b']);
+});
+
 const dbContext = {
   window: { IronLogDomain: domain },
   indexedDB: { open() { throw new Error('IndexedDB should not be opened by validation tests'); } },
@@ -73,11 +100,12 @@ function backup(overrides = {}) {
   };
 }
 
-test('V2 exercises receive V3 tracking metadata during import validation', () => {
+test('V2 backups receive current exercise metadata and an empty body-weight store', () => {
   const normalized = validateBackupPayload(backup());
-  assert.equal(normalized.schemaVersion, 3);
+  assert.equal(normalized.schemaVersion, 4);
   assert.equal(normalized.data.exercises[0].trackingType, 'bodyweight');
   assert.equal(normalized.data.exercises[0].category, 'abs');
+  assert.deepEqual(Array.from(normalized.data.bodyWeights), []);
 });
 
 test('custom legacy exercises default to weighted and uncategorized', () => {
@@ -98,6 +126,41 @@ test('backup validation rejects duplicate record IDs', () => {
   const payload = backup();
   payload.data.profiles.push({ ...payload.data.profiles[0] });
   assert.throws(() => validateBackupPayload(payload), /duplicate ID/);
+});
+
+test('V4 backup validates body-weight records', () => {
+  const payload = backup({
+    bodyWeights: [{ id: 'w1', profileId: 'p1', date: '2026-09-02', weight: 182.4, createdAt: 1 }],
+  });
+  payload.schemaVersion = 4;
+  const normalized = validateBackupPayload(payload);
+  assert.equal(normalized.data.bodyWeights[0].weight, 182.4);
+});
+
+test('body-weight records must be unique per profile and date', () => {
+  const payload = backup({
+    bodyWeights: [
+      { id: 'w1', profileId: 'p1', date: '2026-09-02', weight: 182.4, createdAt: 1 },
+      { id: 'w2', profileId: 'p1', date: '2026-09-02', weight: 183, createdAt: 2 },
+    ],
+  });
+  payload.schemaVersion = 4;
+  assert.throws(() => validateBackupPayload(payload), /duplicate profile\/date/);
+});
+
+test('V4 session stopwatch and duration fields validate', () => {
+  const payload = backup({
+    bodyWeights: [],
+    sessions: [{
+      id: 's1', profileId: 'p1', date: '2026-09-02', status: 'completed', exerciseIds: ['e1'],
+      createdAt: 1, startedAt: 1, completedAt: 61001, durationSeconds: 60,
+      restTimer: { alertSeconds: 90, vibrate: true, elapsedMs: 90000, startedAt: null, running: false, alertFired: true },
+    }],
+  });
+  payload.schemaVersion = 4;
+  const normalized = validateBackupPayload(payload);
+  assert.equal(normalized.data.sessions[0].durationSeconds, 60);
+  assert.equal(normalized.data.sessions[0].restTimer.alertFired, true);
 });
 
 console.log('All Iron Log tests passed.');
